@@ -397,19 +397,22 @@ def execute_benchmark(scenarios, cfg, unprocessed_dir, yard_stick=3):
                     })
 
     # Write unprocessed records to file if any exist
+    unprocessed_file_path = None
     if unprocessed_records:
         ts = get_timestamp().replace(':', '-')
         uuid_ = str(uuid.uuid4()).split('-')[-1]
-        unprocessed_file = os.path.join(unprocessed_dir, f"unprocessed_{ts}_{uuid_}.json")
+        experiment_name = cfg.get("EXPERIMENT_NAME", "unknown")
+        unprocessed_file = os.path.join(unprocessed_dir, f"unprocessed_{experiment_name}_{ts}_{uuid_}.json")
         logging.warning(f"Writing {len(unprocessed_records)} unprocessed records to {unprocessed_file}")
         try:
             with open(unprocessed_file, 'w') as f:
                 json.dump(unprocessed_records, f, indent=2, default=str)
             logging.info(f"Successfully wrote unprocessed records to {unprocessed_file}")
+            unprocessed_file_path = unprocessed_file
         except Exception as e:
             logging.error(f"Failed to write unprocessed records, file: {str(e)}", exc_info=True)
 
-    return all_recs
+    return all_recs, unprocessed_file_path, len(unprocessed_records)
 
 
 def model_sanity_check(models):
@@ -742,10 +745,12 @@ def main(
         logging.info(f"=== Run {run}/{experiment_counts} (Started: {run_timestamp}) ===")
 
         try:
-            results = execute_benchmark(scenarios, cfg, unprocessed_dir, yard_stick=int(yard_stick))
+            results, unprocessed_file_path, unprocessed_count = execute_benchmark(scenarios, cfg, unprocessed_dir, yard_stick=int(yard_stick))
 
             if not results:
                 logging.error(f"Run {run}/{experiment_counts} produced no results. Check the unprocessed records file.")
+                if unprocessed_file_path:
+                    logging.warning(f"Unprocessed records saved to: {unprocessed_file_path}")
                 continue
 
             try:

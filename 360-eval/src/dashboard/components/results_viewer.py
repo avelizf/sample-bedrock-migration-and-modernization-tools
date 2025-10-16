@@ -5,11 +5,35 @@ import pandas as pd
 import json
 from pathlib import Path
 from ..utils.benchmark_runner import sync_evaluations_from_files
-from ..utils.constants import DEFAULT_OUTPUT_DIR
+from ..utils.constants import DEFAULT_OUTPUT_DIR, PROJECT_ROOT
 
 class ResultsViewerComponent:
     """Component for viewing evaluation results."""
-    
+
+    def _count_unprocessed_records(self, eval_name):
+        """Count unprocessed records for a given evaluation name."""
+        try:
+            unprocessed_dir = Path(PROJECT_ROOT) / DEFAULT_OUTPUT_DIR / "unprocessed"
+            if not unprocessed_dir.exists():
+                return 0
+
+            # Look for unprocessed files matching this evaluation name
+            # New format: unprocessed_<experiment_name>_<timestamp>_<uuid>.json
+            matching_files = list(unprocessed_dir.glob(f"unprocessed_{eval_name}_*.json"))
+
+            total_count = 0
+            for file_path in matching_files:
+                try:
+                    with open(file_path, 'r') as f:
+                        records = json.load(f)
+                        total_count += len(records)
+                except:
+                    pass  # Skip files that can't be parsed
+
+            return total_count
+        except:
+            return 0
+
     def render(self):
         """Render the results viewer component."""
         # Sync evaluation statuses from files
@@ -144,6 +168,18 @@ class ResultsViewerComponent:
         
         # Display evaluation details
         st.subheader(f"📊 {eval_config['name']}")
+
+        # Check for unprocessed records and show warning if any exist
+        unprocessed_count = self._count_unprocessed_records(eval_config['name'])
+        if unprocessed_count > 0:
+            col_warn1, col_warn2 = st.columns([3, 1])
+            with col_warn1:
+                st.warning(f"⚠️ This evaluation has **{unprocessed_count}** unprocessed (failed) records. "
+                          f"Click the button to view details and troubleshoot.")
+            with col_warn2:
+                if st.button("View Failed Records", key=f"view_unprocessed_{eval_id}"):
+                    st.session_state.nav_radio = "Unprocessed"
+                    st.rerun()
 
         # Display basic info in columns for better layout
         col1, col2 = st.columns(2)
