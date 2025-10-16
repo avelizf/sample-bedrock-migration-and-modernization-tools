@@ -17,7 +17,8 @@ from utils import (get_timestamp,
                    calculate_average_scores,
                    run_inference,
                    extract_json_response,
-                   llm_judge_template)
+                   llm_judge_template,
+                   optimize_prompt_bedrock)
 from config_validator import validate_jsonl_file
 
 env = load_dotenv()
@@ -348,7 +349,14 @@ def execute_benchmark(scenarios, cfg, unprocessed_dir, yard_stick=3):
                         f"Record processing failed: {scn['model_id']}@{scn['region']}, error: {r['error_code']}")
                     local_unprocessed.append({"scenario": scn, "result": r, "reason": f"API error: {r['error_code']}"})
                 else:
-                    recs.append({**scn, **r})
+                    # Combine scenario and result
+                    result_record = {**scn, **r}
+
+                    # If this is an optimized prompt, append label to model_id for display
+                    if scn.get("prompt_optimization_label"):
+                        result_record["model_id"] = f"{scn['model_id']}_{scn['prompt_optimization_label']}"
+
+                    recs.append(result_record)
                     logging.debug(
                         f"Successfully processed: {scn['model_id']}@{scn['region']}, invocation {invocation + 1}")
             except Exception as e:
@@ -498,7 +506,8 @@ def main(
         judge_file_name=None,
         yard_stick=3,
         vision_enabled=False,
-        experiment_wait_time=0
+        experiment_wait_time=0,
+        prompt_optimization_mode="none"
 ):
     user_defined_metrics_list = None
     if user_defined_metrics:
@@ -581,7 +590,8 @@ def main(
         "TOP_P": 1.0,
         "EXPERIMENT_NAME": experiment_name,
         "judge_models": judges_list,
-        "user_defined_metrics": user_defined_metrics_list
+        "user_defined_metrics": user_defined_metrics_list,
+        "prompt_optimization_mode": prompt_optimization_mode
     }
 
     # Load scenarios
@@ -626,6 +636,103 @@ def main(
 
     scenarios = expand_scenarios(raw_with_models, cfg)
     logging.info(f"Expanded to {len(scenarios)} scenarios")
+
+    # Handle prompt optimization if enabled
+    prompt_optimization_mode = cfg.get("prompt_optimization_mode", "none")
+
+    if prompt_optimization_mode != "none":
+        logging.info(f"Prompt optimization mode: {prompt_optimization_mode}")
+
+        # Track optimization results for verification file
+        optimization_log = []
+        optimized_scenarios = []
+
+        for scn in scenarios:
+            model_id = scn["model_id"]
+            region = scn["region"]
+
+            # Only attempt optimization for bedrock models
+            if "bedrock" in model_id:
+                # Get clean model ID for optimization
+                clean_model_id = model_id.replace("bedrock/", "").replace("converse/", "")
+
+                logging.info(f"Attempting optimization - Original model_id: {model_id}, Cleaned: {clean_model_id}, Region: {region}")
+                print(f"Optimizing for model: {clean_model_id} in region: {region}")
+
+                # Attempt optimization
+                optimization_result = optimize_prompt_bedrock(
+                    prompt=scn["prompt"],
+                    model_id=clean_model_id,
+                    region=region
+                )
+
+                # Log the result immediately
+                if optimization_result["success"]:
+                    logging.info(f"✓ Optimization SUCCESS for {clean_model_id} - Target model: {optimization_result.get('target_model_used')}")
+                    print(f"✓ Successfully optimized prompt for {clean_model_id}")
+                elif optimization_result.get("skipped"):
+                    logging.info(f"⊘ Optimization SKIPPED for {clean_model_id} - Reason: {optimization_result.get('error')}")
+                    print(f"⊘ Skipped optimization for {clean_model_id}: {optimization_result.get('error')}")
+                else:
+                    logging.error(f"✗ Optimization FAILED for {clean_model_id} - Error: {optimization_result.get('error')}")
+                    print(f"✗ Failed to optimize for {clean_model_id}: {optimization_result.get('error')}")
+
+                # Log result
+                log_entry = {
+                    "model_id": model_id,
+                    "region": region,
+                    "original_prompt": scn["prompt"][:200] + "..." if len(scn["prompt"]) > 200 else scn["prompt"],
+                    "success": optimization_result["success"],
+                    "skipped": optimization_result.get("skipped", False),
+                    "error": optimization_result.get("error")
+                }
+
+                if optimization_result["success"]:
+                    optimized_prompt = optimization_result["optimized_prompt"]
+                    log_entry["optimized_prompt"] = optimized_prompt[:200] + "..." if len(optimized_prompt) > 200 else optimized_prompt
+                    log_entry["target_model_used"] = optimization_result.get("target_model_used")
+
+                    if prompt_optimization_mode == "evaluate_both":
+                        # Add original scenario
+                        optimized_scenarios.append(scn)
+
+                        # Add optimized scenario with label (don't modify model_id as it breaks API calls)
+                        optimized_scn = scn.copy()
+                        optimized_scn["prompt"] = optimized_prompt
+                        # Add a separate tracking field instead of modifying model_id
+                        optimized_scn["prompt_optimization_label"] = "Prompt_Optimized"
+                        optimized_scenarios.append(optimized_scn)
+
+                        logging.info(f"Created both original and optimized scenarios for {model_id}")
+                    else:  # optimize_only
+                        # Replace with optimized prompt (no label needed)
+                        scn["prompt"] = optimized_prompt
+                        optimized_scenarios.append(scn)
+                        logging.info(f"Replaced prompt with optimized version for {model_id}")
+                else:
+                    # Failed or skipped - use original
+                    if optimization_result.get("skipped"):
+                        logging.info(f"Skipped optimization for {model_id}: {optimization_result['error']}")
+                    else:
+                        logging.warning(f"Failed to optimize for {model_id}: {optimization_result['error']}")
+                    optimized_scenarios.append(scn)
+
+                optimization_log.append(log_entry)
+            else:
+                # Non-Bedrock model, keep original
+                optimized_scenarios.append(scn)
+
+        # Save optimization log for user verification
+        if optimization_log:
+            log_file_path = os.path.join(output_dir, f"prompt_optimization_log_{experiment_name}_{ts}.json")
+            with open(log_file_path, 'w') as f:
+                json.dump(optimization_log, f, indent=2)
+            logging.info(f"Saved prompt optimization log to {log_file_path}")
+            print(f"Prompt optimization log saved to: {log_file_path}")
+
+        # Replace scenarios with optimized version
+        scenarios = optimized_scenarios
+        logging.info(f"Final scenario count after optimization: {len(scenarios)}")
 
     for run in range(1, experiment_counts + 1):
         # Add timestamp for time-based performance tracking
@@ -732,6 +839,10 @@ if __name__ == "__main__":
     p.add_argument("--judge_file_name", default=None)
     p.add_argument("--evaluation_pass_threshold", default=3)
     p.add_argument("--vision_enabled", type=lambda x: x.lower() == 'true', default=False)
+    p.add_argument("--prompt_optimization_mode",
+                   default="none",
+                   choices=["none", "optimize_only", "evaluate_both"],
+                   help="Prompt optimization mode (Bedrock only): none, optimize_only, or evaluate_both")
     args = p.parse_args()
     main(
         args.input_file,
@@ -748,5 +859,6 @@ if __name__ == "__main__":
         args.judge_file_name,
         args.evaluation_pass_threshold,
         args.vision_enabled,
-        args.experiment_wait_time
+        args.experiment_wait_time,
+        args.prompt_optimization_mode
     )

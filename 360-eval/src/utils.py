@@ -23,6 +23,224 @@ logger = logging.getLogger(__name__)
 litellm.drop_params = True
 
 # ----------------------------------------
+# Prompt Optimization Configuration
+# ----------------------------------------
+
+# Supported regions for prompt optimization
+PROMPT_OPTIMIZATION_SUPPORTED_REGIONS = [
+    "us-east-1",      # US East (N. Virginia)
+    "us-west-2",      # US West (Oregon)
+    "ap-south-1",     # Asia Pacific (Mumbai)
+    "ap-southeast-2", # Asia Pacific (Sydney)
+    "ca-central-1",   # Canada (Central)
+    "eu-central-1",   # Europe (Frankfurt)
+    "eu-west-1",      # Europe (Ireland)
+    "eu-west-2",      # Europe (London)
+    "eu-west-3",      # Europe (Paris)
+    "sa-east-1"       # South America (São Paulo)
+]
+
+# Map model ID patterns to optimization target models
+# This mapping handles various model families and versions
+MODEL_FAMILY_OPTIMIZATION_MAP = {
+    # Amazon Nova family
+    "amazon.nova-lite": "amazon.nova-lite-v1:0",
+    "amazon.nova-micro": "amazon.nova-micro-v1:0",
+    "amazon.nova-pro": "amazon.nova-pro-v1:0",
+    "amazon.nova-premier": "amazon.nova-premier-v1:0",
+
+    # Anthropic Claude 3 family
+    "anthropic.claude-3-haiku": "anthropic.claude-3-haiku-20240307-v1:0",
+    "anthropic.claude-3-sonnet": "anthropic.claude-3-sonnet-20240229-v1:0",
+    "anthropic.claude-3-opus": "anthropic.claude-3-opus-20240229-v1:0",
+
+    # Anthropic Claude 3.5 family
+    "anthropic.claude-3-5-haiku": "anthropic.claude-3-5-haiku-20241022-v1:0",
+    "anthropic.claude-3-5-sonnet": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+
+    # Anthropic Claude 3.7/4 family
+    "anthropic.claude-3-7-sonnet": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+    "anthropic.claude-sonnet-4": "anthropic.claude-sonnet-4-20250514-v1:0",
+    "anthropic.claude-opus-4": "anthropic.claude-opus-4-20250514-v1:0",
+
+    # DeepSeek
+    "deepseek.deepseek-r1": "deepseek.deepseek-r1-v1:0",
+    "deepseek.v3": "deepseek.deepseek-r1-v1:0",  # Map v3 to R1 for optimization
+
+    # Meta Llama family
+    "meta.llama3-70b": "meta.llama3-70b-instruct-v1:0",
+    "meta.llama3-1-70b": "meta.llama3-1-70b-instruct-v1:0",
+    "meta.llama3-2-11b": "meta.llama3-2-11b-instruct-v1:0",
+    "meta.llama3-3-70b": "meta.llama3-3-70b-instruct-v1:0",
+    "meta.llama4-maverick-17b": "meta.llama4-maverick-17b-instruct-v1:0",
+    "meta.llama4-scout-17b": "meta.llama4-scout-17b-instruct-v1:0",
+
+    # Mistral family
+    "mistral.mistral-large-2402": "mistral.mistral-large-2402-v1:0",
+    "mistral.mistral-large-2407": "mistral.mistral-large-2407-v1:0",
+    "mistral.mixtral": "mistral.mistral-large-2407-v1:0",  # Map Mixtral to Large for optimization
+}
+
+
+def get_optimization_target_model(model_id):
+    """
+    Map a model ID to its optimization target model.
+
+    This function handles various model ID formats including:
+    - Regional prefixes (us., eu., ap., ca., sa.)
+    - bedrock/ and converse/ prefixes
+    - Different version suffixes
+
+    Args:
+        model_id: The actual model ID (may include bedrock/ prefix, regional prefix, version)
+
+    Returns:
+        tuple: (optimization_target_model, is_supported)
+               optimization_target_model is None if not supported
+
+    Examples:
+        >>> get_optimization_target_model("bedrock/us.amazon.nova-pro-v1:0")
+        ("amazon.nova-pro-v1:0", True)
+        >>> get_optimization_target_model("anthropic.claude-3-5-sonnet-20241022-v2:0")
+        ("anthropic.claude-3-5-sonnet-20241022-v2:0", True)
+        >>> get_optimization_target_model("openai/gpt-4o")
+        (None, False)
+    """
+    # Remove bedrock and converse prefixes
+    clean_id = model_id.replace("bedrock/", "").replace("converse/", "")
+
+    # Remove regional prefixes (us., eu., ap., ca., sa.)
+    if "." in clean_id:
+        parts = clean_id.split(".", 1)
+        if parts[0] in ["us", "eu", "ap", "ca", "sa"]:
+            clean_id = parts[1]
+
+    # Try to match against model family patterns
+    for pattern, target in MODEL_FAMILY_OPTIMIZATION_MAP.items():
+        if pattern in clean_id:
+            return target, True
+
+    return None, False
+
+
+def optimize_prompt_bedrock(prompt, model_id, region='us-east-1'):
+    """
+    Optimize a prompt using Bedrock's optimize_prompt API.
+
+    This function:
+    1. Validates the region supports prompt optimization
+    2. Maps the model ID to a supported optimization target
+    3. Calls the Bedrock optimize_prompt API
+    4. Parses the streaming response to extract optimized prompt and analysis
+
+    Args:
+        prompt: The original prompt text to optimize
+        model_id: Model ID to optimize for (cleaned, no bedrock/ prefix)
+        region: AWS region where the optimization API will be called
+
+    Returns:
+        dict with:
+            - 'success': bool - True if optimization succeeded
+            - 'optimized_prompt': str - The optimized prompt text (if success=True)
+            - 'analysis': str - Analysis from optimization API (if success=True)
+            - 'target_model_used': str - The optimization target model used (if success=True)
+            - 'error': str - Error message (if success=False)
+            - 'skipped': bool - True if region/model not supported (graceful skip)
+
+    Raises:
+        No exceptions raised - all errors returned in result dict
+    """
+    import boto3
+
+    # Check if region supports optimization
+    if region not in PROMPT_OPTIMIZATION_SUPPORTED_REGIONS:
+        logger.info(f"Region {region} does not support prompt optimization - skipping")
+        return {
+            "success": False,
+            "skipped": True,
+            "error": f"Region {region} does not support prompt optimization"
+        }
+
+    # Get optimization target model
+    target_model, is_supported = get_optimization_target_model(model_id)
+
+    if not is_supported:
+        logger.info(f"Model {model_id} not supported for optimization - skipping")
+        return {
+            "success": False,
+            "skipped": True,
+            "error": f"Model {model_id} not supported for optimization"
+        }
+
+    try:
+        logger.info(f"Optimizing prompt for model {model_id} using target {target_model} in region {region}")
+        client = boto3.client('bedrock-agent-runtime', region_name=region)
+
+        input_data = {
+            "textPrompt": {
+                "text": prompt
+            }
+        }
+
+        response = client.optimize_prompt(
+            input=input_data,
+            targetModelId=target_model
+        )
+
+        # Parse streaming response
+        optimized_prompt = None
+        analysis = None
+
+        event_stream = response.get('optimizedPrompt', [])
+
+        for event in event_stream:
+            if 'optimizedPromptEvent' in event:
+                optimized_prompt_event = event['optimizedPromptEvent']
+                # Navigate the nested structure to get the text
+                text_prompt_data = optimized_prompt_event.get('optimizedPrompt', {}).get('textPrompt', {})
+                optimized_prompt = text_prompt_data.get('text', '')
+
+            elif 'analyzePromptEvent' in event:
+                analysis_event = event['analyzePromptEvent']
+                # Extract analysis text or metadata
+                analysis = str(analysis_event)
+
+        if optimized_prompt:
+            logger.info(f"Successfully optimized prompt for {model_id} (original: {len(prompt)} chars, optimized: {len(optimized_prompt)} chars)")
+            return {
+                "success": True,
+                "optimized_prompt": optimized_prompt,
+                "analysis": analysis or "No analysis provided",
+                "target_model_used": target_model,
+                "skipped": False
+            }
+        else:
+            logger.error("No optimized prompt returned from API")
+            return {
+                "success": False,
+                "error": "No optimized prompt returned from API",
+                "skipped": False
+            }
+
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_msg = e.response.get('Error', {}).get('Message', str(e))
+        logger.error(f"AWS ClientError optimizing prompt for {model_id}: {error_code} - {error_msg}")
+        return {
+            "success": False,
+            "error": f"AWS Error {error_code}: {error_msg}",
+            "skipped": False
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error optimizing prompt for {model_id}: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e),
+            "skipped": False
+        }
+
+
+# ----------------------------------------
 # Request Builders
 # ----------------------------------------
 

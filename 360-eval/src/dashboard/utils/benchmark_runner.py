@@ -376,6 +376,10 @@ def run_benchmark_process(eval_id):
         if evaluation_config.get("vision_enabled", False):
             cmd.extend(["--vision_enabled", "True"])
 
+        # Add prompt optimization mode
+        if evaluation_config.get("prompt_optimization_mode", "none") != "none":
+            cmd.extend(["--prompt_optimization_mode", evaluation_config["prompt_optimization_mode"]])
+
         # Start benchmark execution
         working_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         dashboard_logger.info(f"Starting benchmark execution for {eval_id} - PID will be assigned, output to {output_dir}")
