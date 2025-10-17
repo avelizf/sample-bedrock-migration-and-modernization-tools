@@ -17,7 +17,7 @@ from botocore.exceptions import ClientError
 import litellm
 
 litellm.drop_params = True
-
+# litellm.set_verbose = True
 
 logger = logging.getLogger(__name__)
 litellm.drop_params = True
@@ -245,6 +245,64 @@ def optimize_prompt_bedrock(prompt, model_id, region='us-east-1'):
 # ----------------------------------------
 
 
+def prepare_model_for_litellm(model_id):
+    """
+    Prepare model ID for litellm completion call.
+    For Bedrock models, ensures correct format is bedrock/<model-id>.
+    LiteLLM automatically uses the converse route for supported models.
+
+    Handles edge cases:
+    - Missing bedrock/ prefix (adds it back)
+    - Removes any /converse/ prefix (litellm handles routing automatically)
+    - Already correct format (returns as-is)
+
+    Args:
+        model_id: Model ID (e.g., "bedrock/us.amazon.nova-pro-v1:0" or "bedrock/converse/us.amazon.nova-pro-v1:0")
+
+    Returns:
+        str: Model ID ready for litellm (e.g., "bedrock/us.amazon.nova-pro-v1:0")
+
+    Examples:
+        >>> prepare_model_for_litellm("bedrock/us.amazon.nova-pro-v1:0")
+        "bedrock/us.amazon.nova-pro-v1:0"
+        >>> prepare_model_for_litellm("bedrock/converse/us.amazon.nova-pro-v1:0")
+        "bedrock/us.amazon.nova-pro-v1:0"
+        >>> prepare_model_for_litellm("converse/us.amazon.nova-pro-v1:0")
+        "bedrock/us.amazon.nova-pro-v1:0"
+        >>> prepare_model_for_litellm("us.amazon.nova-pro-v1:0")
+        "bedrock/us.amazon.nova-pro-v1:0"
+        >>> prepare_model_for_litellm("openai/gpt-4o")
+        "openai/gpt-4o"
+    """
+
+    # Check if this is a Bedrock model (contains regional prefix like us., eu., or anthropic., amazon., etc.)
+    is_bedrock_model = any(indicator in model_id for indicator in
+                          ['us.', 'eu.', 'ap.', 'ca.', 'sa.',  # Regional prefixes
+                           'anthropic.', 'amazon.', 'meta.', 'mistral.', 'deepseek.', 'qwen.',  # Model providers on Bedrock
+                           'openai.gpt-oss'])  # OpenAI on Bedrock
+
+    if not is_bedrock_model:
+        # Not a Bedrock model, return as-is
+        logger.debug(f"Not a Bedrock model, returning as-is: {model_id}")
+        return model_id
+
+    # It's a Bedrock model - ensure correct format: bedrock/<model-id>
+    # LiteLLM will automatically use converse route for supported models
+
+    # Step 1: Remove any existing bedrock/ and converse/ prefixes (including stacked ones)
+    clean_id = model_id
+    while clean_id.startswith('bedrock/') or clean_id.startswith('converse/'):
+        if clean_id.startswith('bedrock/'):
+            clean_id = clean_id.replace('bedrock/', '', 1)
+        if clean_id.startswith('converse/'):
+            clean_id = clean_id.replace('converse/', '', 1)
+
+    # Step 2: Build the correct format - litellm handles converse routing automatically
+    correct_id = f"bedrock/{clean_id}"
+
+    return correct_id
+
+
 def setup_logging(log_dir='logs', experiment='none'):
     ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     os.makedirs(log_dir, exist_ok=True)
@@ -411,14 +469,20 @@ class RetryTracker:
     def increment(self, retry_state):
         self.attempts = retry_state.attempt_number
         wait_time = retry_state.next_action.sleep if retry_state.next_action else 0
-        logger.info(f"Retry attempt {self.attempts}, sleeping for {wait_time} seconds")
-        
+
+        # Log first retry at INFO, subsequent retries at DEBUG
+        if self.attempts == 1:
+            logger.info(f"First retry attempt, sleeping for {wait_time} seconds")
+        else:
+            logger.debug(f"Retry attempt {self.attempts}, sleeping for {wait_time} seconds")
+
         # If we're about to wait 300 seconds and already had one 300s wait, stop retrying
         if wait_time >= 300:
             if self.had_300_second_wait:
                 logger.info("Already waited 300 seconds once, stopping retries")
                 raise Exception("Max wait time reached - stopping after one 300-second retry")
             self.had_300_second_wait = True
+            logger.warning(f"Long wait time ({wait_time}s) on retry attempt {self.attempts}")
 
 
 # Retry decorator with exponential backoff
@@ -434,8 +498,10 @@ def _call_llm_with_retry(model_name, messages, provider_params, retry_tracker, s
     def _api_call():
         try:
             time_ = time.time()
+            # Prepare model ID for litellm
+            litellm_model = prepare_model_for_litellm(model_name)
             completed = completion(
-                model=model_name,
+                model=litellm_model,
                 messages=messages,
                 stream=stream,
                 **provider_params
@@ -461,7 +527,11 @@ def _call_llm_with_retry(model_name, messages, provider_params, retry_tracker, s
                 logger.error(f"BadRequestError (non-retryable): {error_msg}")
                 raise
         except RETRYABLE_EXCEPTIONS as e:
-            logger.warning(f"Retryable error occurred: {str(e)}")
+            # Only log first retryable error at WARNING, rest at DEBUG to reduce noise
+            if retry_tracker.attempts == 0:
+                logger.warning(f"Retryable error occurred: {type(e).__name__}: {str(e)[:100]}")
+            else:
+                logger.debug(f"Retryable error (attempt {retry_tracker.attempts}): {type(e).__name__}")
             # Add jitter to avoid thundering herd
             jitter = random.uniform(0, 3)
             time.sleep(jitter)
@@ -783,8 +853,10 @@ def check_model_access(provider_params, model_id):
     """
     try:
         messages = [{"content": 'HI', "role": "user"}]
+        # Prepare model ID for litellm (adds /converse for Bedrock models)
+        litellm_model = prepare_model_for_litellm(model_id)
         completed = completion(
-            model=model_id,
+            model=litellm_model,
             messages=messages,
             stream=True,
             **provider_params

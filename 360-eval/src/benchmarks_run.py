@@ -107,11 +107,9 @@ def evaluate_with_judges(judges,
     for j in judges:
         try:
             logging.debug(f"Evaluating with judge model {j['model_id']}")
-            model_identification = j["model_id"]
-            if "bedrock" in j["model_id"]:
-                model_identification = model_identification.replace("bedrock", "bedrock/converse")
+            # Model ID preparation for litellm is now handled centrally in run_inference()
             r = evaluate_with_llm_judge(
-                judge_model_id=model_identification,
+                judge_model_id=j["model_id"],
                 judge_region=j["region"],
                 prompt=prompt,
                 model_response=model_response,
@@ -198,8 +196,7 @@ def benchmark(
             params['api_key'] = os.getenv('AZURE_API_KEY')
         elif "bedrock" in model_id:
             params['aws_region_name'] = region
-            if 'converse' not in model_id:
-                model_id = model_id.replace("bedrock", "bedrock/converse")
+            # Model ID preparation for litellm is now handled centrally in run_inference()
         elif 'openai/' in model_id:
             params['api_key'] = os.getenv('OPENAI_API')
         else:
@@ -326,8 +323,18 @@ def execute_benchmark(scenarios, cfg, unprocessed_dir, yard_stick=3):
                 else:
                     throttle_info = {"throttled": False, "wait_time": 0}
 
-                logging.info(
-                    f"Running scenario: {scn['model_id']}@{scn['region']}, temp={scn['TEMPERATURE']}, invocation {invocation + 1}/{cfg['invocations_per_scenario']}")
+                # Smart logging: log first, every 10th, and last invocation to reduce noise
+                total_invocations = cfg['invocations_per_scenario']
+                is_first = invocation == 0
+                is_last = invocation == total_invocations - 1
+                is_milestone = (invocation + 1) % 10 == 0
+
+                if is_first or is_last or is_milestone:
+                    logging.info(
+                        f"Running scenario: {scn['model_id']}@{scn['region']}, temp={scn['TEMPERATURE']}, invocation {invocation + 1}/{total_invocations}")
+                else:
+                    logging.debug(
+                        f"Running scenario: {scn['model_id']}@{scn['region']}, temp={scn['TEMPERATURE']}, invocation {invocation + 1}/{total_invocations}")
 
                 # Use per-scenario user_defined_metrics if available, otherwise fall back to global
                 scenario_metrics = scn.get("user_defined_metrics", "")
@@ -468,8 +475,9 @@ def model_sanity_check(models):
             params['api_key'] = os.getenv('GOOGLE_API')
         elif 'azure' in model_id:
             params['api_key'] = os.getenv('AZURE_API_KEY')
-        elif 'bedrock' in model_id and 'converse' not in model_id:
-                model_id = model_id.replace("bedrock", "bedrock/converse")
+        elif 'bedrock' in model_id:
+            # Model ID preparation for litellm is now handled centrally in check_model_access()
+            pass
         elif 'openai/' in model_id:
             params['api_key'] = os.getenv('OPENAI_API')
         else:
