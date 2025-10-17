@@ -143,7 +143,7 @@ class ResultsViewerComponent:
 
                 if metrics_list:
                     metrics_df = pd.DataFrame(metrics_list)
-                    st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+                    st.dataframe(metrics_df, width='stretch', hide_index=True)
 
                     # Add explanation
                     with st.expander("ℹ️ About Rate Limiting Metrics"):
@@ -350,7 +350,7 @@ class ResultsViewerComponent:
             if isinstance(models_info[0], dict):
                 # New format with complete information
                 models_df = pd.DataFrame(models_info)
-                st.dataframe(models_df, use_container_width=True, hide_index=True)
+                st.dataframe(models_df, width='stretch', hide_index=True)
             else:
                 # Legacy format - just model IDs
                 st.write("Models (legacy format):")
@@ -366,7 +366,7 @@ class ResultsViewerComponent:
             if isinstance(judges_info[0], dict):
                 # New format with complete information
                 judges_df = pd.DataFrame(judges_info)
-                st.dataframe(judges_df, use_container_width=True, hide_index=True)
+                st.dataframe(judges_df, width='stretch', hide_index=True)
             else:
                 # Legacy format - just model IDs
                 st.write("Judges (legacy format):")

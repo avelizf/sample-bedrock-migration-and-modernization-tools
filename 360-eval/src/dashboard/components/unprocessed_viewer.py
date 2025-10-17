@@ -100,7 +100,7 @@ class UnprocessedRecordsViewer:
                 'modified': 'Last Modified'
             })
             file_df['Size (KB)'] = file_df['Size (KB)'].round(2)
-            st.dataframe(file_df, use_container_width=True, hide_index=True)
+            st.dataframe(file_df, width='stretch', hide_index=True)
 
         # Summary statistics
         st.divider()
@@ -154,7 +154,7 @@ class UnprocessedRecordsViewer:
                 hole=0.4
             )
             fig_errors.update_layout(template="plotly_dark")
-            st.plotly_chart(fig_errors, use_container_width=True)
+            st.plotly_chart(fig_errors, width='stretch')
 
         with tab2:
             # Errors by model
@@ -168,7 +168,7 @@ class UnprocessedRecordsViewer:
                 labels={'model_id': 'Model', 'count': 'Failed Records'}
             )
             fig_models.update_layout(template="plotly_dark", xaxis_tickangle=-45)
-            st.plotly_chart(fig_models, use_container_width=True)
+            st.plotly_chart(fig_models, width='stretch')
 
         with tab3:
             # Errors by task type
@@ -182,7 +182,7 @@ class UnprocessedRecordsViewer:
                 labels={'task_type': 'Task Type', 'count': 'Failed Records'}
             )
             fig_tasks.update_layout(template="plotly_dark", xaxis_tickangle=-45)
-            st.plotly_chart(fig_tasks, use_container_width=True)
+            st.plotly_chart(fig_tasks, width='stretch')
 
         # Detailed records table
         st.divider()
@@ -226,7 +226,7 @@ class UnprocessedRecordsViewer:
             'reason': 'Failure Reason',
             'api_status': 'API Status'
         })
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        st.dataframe(display_df, width='stretch', hide_index=True)
 
         # Detailed view expander
         st.divider()
