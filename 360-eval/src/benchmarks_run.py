@@ -60,15 +60,31 @@ def evaluate_with_llm_judge(judge_model_id,
                              stream=False)
         text = resp['text']
     except Exception as e:
-        logging.error(f"Judge error ({judge_model_id}): {e}")
-        return {"judgment": "Error inference response", "explanation": str(e), "full_response": "",
-                "scores": {"score": "NULL"}}
+        logging.error(f"Judge inference failed ({judge_model_id}): {e}", exc_info=True)
+        return {
+            "judgment": "Error inference response",
+            "explanation": str(e),
+            "full_response": "",
+            "scores": {"score": "NULL"},
+            "judge_input_tokens": 0,
+            "judge_output_tokens": 0,
+            "error_type": "inference_failure",
+            "original_error": str(e)
+        }
 
     try:
         eval_results = extract_json_response(all_metrics, text, judge_model_id, cfg)
         if not eval_results:
-            return {"judgment": "Error Parsing response", "explanation": "JSON NOT FOUND", "full_response": text,
-                    "scores": {"score": "NULL"}}
+            logging.warning(f"Judge response parsing failed ({judge_model_id}): JSON NOT FOUND in response")
+            return {
+                "judgment": "Error Parsing response",
+                "explanation": "JSON NOT FOUND",
+                "full_response": text,
+                "scores": {"score": "NULL"},
+                "judge_input_tokens": resp.get('inputTokens', 0),
+                "judge_output_tokens": resp.get('outputTokens', 0),
+                "error_type": "json_not_found"
+            }
 
         judgment = "PASS"
         explanation = [key for key, val in eval_results["scores"].items() if val < yard_stick]
@@ -85,9 +101,17 @@ def evaluate_with_llm_judge(judge_model_id,
             "judge_output_tokens": resp['outputTokens']
         }
     except Exception as e:
-        logging.error(f"Error when evaluation with {judge_model_id}: {e}")
-        return {"judgment": "Error Parsing response", "explanation": str(e), "full_response": text,
-                "scores": {"score": "NULL"}}
+        logging.error(f"Judge evaluation parsing failed ({judge_model_id}): {e}", exc_info=True)
+        return {
+            "judgment": "Error Parsing response",
+            "explanation": str(e),
+            "full_response": text,
+            "scores": {"score": "NULL"},
+            "judge_input_tokens": resp.get('inputTokens', 0),
+            "judge_output_tokens": resp.get('outputTokens', 0),
+            "error_type": "parsing_failure",
+            "original_error": str(e)
+        }
 
     return payload
 
@@ -134,20 +158,30 @@ def evaluate_with_judges(judges,
                 results.append({"model": j["model_id"], **r})
                 continue
 
-            r['judge_input_token_cost'] = r["judge_input_tokens"] * (
-                        j["input_cost_per_1k"] / 1000)  # After 15 years I still don't trust the order of operators :)
-            r['judge_output_token_cost'] = r["judge_output_tokens"] * (j["output_cost_per_1k"] / 1000)
+            # Defensive cost calculation with defaults
+            judge_input_tokens = r.get("judge_input_tokens", 0)
+            judge_output_tokens = r.get("judge_output_tokens", 0)
+            r['judge_input_token_cost'] = judge_input_tokens * (j["input_cost_per_1k"] / 1000)
+            r['judge_output_token_cost'] = judge_output_tokens * (j["output_cost_per_1k"] / 1000)
             results.append({"model": j["model_id"], **r})
             logging.debug(
                 f"Successfully evaluated with judge {j['model_id']}, judgment: {r.get('judgment', 'Unknown')}")
         except Exception as e:
             logging.error(f"Exception evaluating with judge {j['model_id']}: {str(e)}", exc_info=True)
-            results.append({"model": j["model_id"], "judgment": "Judge Exception", "explanation": str(e),
-                            "scores": {"score": "NULL"}})
+            results.append({
+                "model": j["model_id"],
+                "judgment": "Judge Exception",
+                "explanation": str(e),
+                "scores": {"score": "NULL"},
+                "judge_input_tokens": 0,
+                "judge_output_tokens": 0,
+                "error_type": "judge_exception"
+            })
 
-    pass_ct = sum(1 for r in results if r["judgment"] == "PASS")
-    fail_ct = sum(1 for r in results if r["judgment"] == "FAIL")
-    tot_cost = sum(r["judge_input_token_cost"] + r['judge_output_token_cost'] for r in results)
+    pass_ct = sum(1 for r in results if r.get("judgment") == "PASS")
+    fail_ct = sum(1 for r in results if r.get("judgment") == "FAIL")
+    # Defensive cost calculation - handle missing cost fields gracefully
+    tot_cost = sum(r.get("judge_input_token_cost", 0) + r.get('judge_output_token_cost', 0) for r in results)
 
     avg_scores = calculate_average_scores([result['scores'] for result in results])
     maj = "PASS" if pass_ct > fail_ct else "FAIL"
@@ -241,15 +275,49 @@ def benchmark(
             logging.error(f"Target model error: Model {model_id} returned an empty output.")
 
     except ClientError as err:
-        status = err.response["Error"]["Code"]
-        status += f" {str(err)}"
-        logging.error(f"API error evaluating {model_id}: {status}")
+        # Log detailed error BEFORE converting to status string
+        error_code = err.response["Error"]["Code"]
+        error_message = err.response["Error"].get("Message", str(err))
+        logging.error(
+            f"AWS API ClientError for {model_id}@{region}: {error_code} - {error_message}",
+            exc_info=True,
+            extra={
+                "error_type": "client_error",
+                "error_code": error_code,
+                "model_id": model_id,
+                "region": region
+            }
+        )
+        status = f"{error_code}: {error_message}"
+        err_code = error_code
     except KeyError as key_err:
+        # Log KeyError with full context to identify root cause
+        logging.error(
+            f"KeyError for {model_id}@{region}: Missing key '{str(key_err)}' - This indicates a data structure issue",
+            exc_info=True,
+            extra={
+                "error_type": "key_error",
+                "missing_key": str(key_err),
+                "model_id": model_id,
+                "region": region
+            }
+        )
         status = f"KeyError: {str(key_err)}"
-        logging.error(f"Unexpected error evaluating {model_id}: {status}")
+        err_code = "KEY_ERROR"
     except Exception as e:
-        status = str(e)
-        logging.error(f"Unexpected error evaluating {model_id}: {status}")
+        # Log general exception with full stack trace
+        logging.error(
+            f"Unexpected exception for {model_id}@{region}: {type(e).__name__} - {str(e)}",
+            exc_info=True,
+            extra={
+                "error_type": "general_exception",
+                "exception_class": type(e).__name__,
+                "model_id": model_id,
+                "region": region
+            }
+        )
+        status = f"{type(e).__name__}: {str(e)}"
+        err_code = type(e).__name__.upper()
 
     return {
         "time_to_first_byte": time_to_first_byte,
@@ -367,11 +435,57 @@ def execute_benchmark(scenarios, cfg, unprocessed_dir, yard_stick=3):
                 r["throttle_wait_time"] = throttle_info["wait_time"]
                 r["target_rpm"] = target_rpm
 
-                # Check if the record was processed successfully
-                if r["api_call_status"] != "Success" or r["error_code"] is not None:
+                # Enhanced error detection - check API status, error code, and evaluation success
+                perf = r.get("performance_metrics", {})
+                judge_details = perf.get("judge_details", [])
+
+                # Check for failures: API errors OR empty performance metrics OR judge evaluation failures
+                has_api_error = r["api_call_status"] != "Success" or r["error_code"] is not None
+                has_no_evaluation = not perf or not judge_details
+                has_judge_errors = any(
+                    j.get("error_type") in ["inference_failure", "parsing_failure", "judge_exception", "json_not_found"]
+                    for j in judge_details
+                ) if judge_details else False
+
+                if has_api_error or has_no_evaluation or has_judge_errors:
+                    # Determine failure reason and error classification for better context
+                    if has_api_error:
+                        reason = f"API error: {r.get('api_call_status', 'Unknown')} - {r.get('error_code', 'No error code')}"
+                        error_classification = "api_failure"
+                    elif has_no_evaluation:
+                        reason = "Evaluation failure: No judge evaluation performed"
+                        error_classification = "evaluation_missing"
+                    else:
+                        failed_judges = [j.get("model") for j in judge_details if j.get("error_type")]
+                        reason = f"Judge evaluation failure: {', '.join(failed_judges)}"
+                        error_classification = "judge_failure"
+
                     logging.warning(
-                        f"Record processing failed: {scn['model_id']}@{scn['region']}, error: {r['error_code']}")
-                    local_unprocessed.append({"scenario": scn, "result": r, "reason": f"API error: {r['error_code']}"})
+                        f"Record processing failed: {scn['model_id']}@{scn['region']}, reason: {reason}",
+                        extra={
+                            "error_classification": error_classification,
+                            "invocation": invocation,
+                            "scenario": scn['model_id']
+                        }
+                    )
+
+                    # Enhanced unprocessed record with full context
+                    local_unprocessed.append({
+                        "scenario": scn,
+                        "result": r,
+                        "reason": reason,
+                        "error_classification": error_classification,
+                        "timestamp": get_timestamp(),
+                        "invocation": invocation,
+                        "judge_errors": [
+                            {
+                                "judge": j.get("model"),
+                                "error_type": j.get("error_type"),
+                                "explanation": j.get("explanation")
+                            }
+                            for j in judge_details if j.get("error_type")
+                        ] if has_judge_errors else []
+                    })
                 else:
                     # Combine scenario and result
                     result_record = {**scn, **r}
@@ -384,10 +498,29 @@ def execute_benchmark(scenarios, cfg, unprocessed_dir, yard_stick=3):
                     logging.debug(
                         f"Successfully processed: {scn['model_id']}@{scn['region']}, invocation {invocation + 1}")
             except Exception as e:
-                error_msg = f"Exception processing record: {str(e)}"
-                logging.error(error_msg)
-                local_unprocessed.append(
-                    {"scenario": scn, "exception": str(e), "reason": "Exception during processing"})
+                # Log exception with full context and stack trace
+                logging.error(
+                    f"Exception processing record for {scn['model_id']}@{scn['region']}: {type(e).__name__} - {str(e)}",
+                    exc_info=True,
+                    extra={
+                        "error_type": "processing_exception",
+                        "exception_class": type(e).__name__,
+                        "model_id": scn['model_id'],
+                        "region": scn['region'],
+                        "invocation": invocation
+                    }
+                )
+
+                # Enhanced unprocessed record with full error context
+                local_unprocessed.append({
+                    "scenario": scn,
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "reason": f"Processing exception: {type(e).__name__}",
+                    "error_classification": "processing_exception",
+                    "timestamp": get_timestamp(),
+                    "invocation": invocation
+                })
 
             if cfg["sleep_between_invocations"]:
                 time.sleep(cfg["sleep_between_invocations"])
@@ -410,13 +543,23 @@ def execute_benchmark(scenarios, cfg, unprocessed_dir, yard_stick=3):
                 else:
                     logging.warning("Received empty result from a scenario task")
             except Exception as e:
-                logging.error(f"Exception in ThreadPoolExecutor task: {str(e)}", exc_info=True)
+                # Log ThreadPoolExecutor exception with full context
+                logging.error(
+                    f"Exception in ThreadPoolExecutor task: {type(e).__name__} - {str(e)}",
+                    exc_info=True,
+                    extra={
+                        "error_type": "executor_exception",
+                        "exception_class": type(e).__name__
+                    }
+                )
                 # Record the failure but allow other tasks to continue
                 with lock:
                     unprocessed_records.append({
                         "scenario": "Unknown (future failed)",
                         "exception": str(e),
-                        "reason": "Exception in ThreadPoolExecutor task",
+                        "exception_type": type(e).__name__,
+                        "reason": f"ThreadPoolExecutor exception: {type(e).__name__}",
+                        "error_classification": "executor_exception",
                         "timestamp": get_timestamp()
                     })
 
